@@ -62,7 +62,7 @@ require (
 	github.com/docker/go-units v0.5.0
 	github.com/felixge/fgprof v0.9.5
 	github.com/fluid-cloudnative/advanced-statefulset v0.0.0-20260518081011-ad1ab7583915
-	github.com/go-logr/logr v1.4.3
+	github.com/go-logr/logr v1.4.4
 	github.com/golang/glog v1.2.5
 	github.com/golang/mock v1.6.0
 	github.com/kubernetes-csi/drivers v1.0.2
