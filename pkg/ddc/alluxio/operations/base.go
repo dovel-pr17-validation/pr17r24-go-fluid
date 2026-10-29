@@ -1,0 +1,590 @@
+/*
+Copyright 2020 The Fluid Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package operations
+
+import (
+	"context"
+	"fmt"
+	"regexp"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/fluid-cloudnative/fluid/pkg/common"
+	"github.com/fluid-cloudnative/fluid/pkg/utils/kubeclient"
+	securityutils "github.com/fluid-cloudnative/fluid/pkg/utils/security"
+	"github.com/go-logr/logr"
+	"github.com/pkg/errors"
+
+	"github.com/fluid-cloudnative/fluid/pkg/utils"
+)
+
+type AlluxioFileUtils struct {
+	podName   string
+	namespace string
+	container string
+	log       logr.Logger
+}
+
+func NewAlluxioFileUtils(podName string, containerName string, namespace string, log logr.Logger) AlluxioFileUtils {
+
+	return AlluxioFileUtils{
+		podName:   podName,
+		namespace: namespace,
+		container: containerName,
+		log:       log,
+	}
+}
+
+// exec with timeout
+func (a AlluxioFileUtils) exec(command []string, verbose bool) (stdout string, stderr string, err error) {
+	// redact sensitive info in command for printing
+	redactedCommand := securityutils.FilterCommand(command)
+
+	a.log.V(1).Info("Exec command start", "command", redactedCommand)
+	stdout, stderr, err = kubeclient.ExecCommandInContainerWithTimeoutContext(context.TODO(), a.podName, a.container, a.namespace, command, common.FileUtilsExecTimeout)
+	if err != nil {
+		err = errors.Wrapf(err, "error when executing command %v", redactedCommand)
+		return
+	}
+	a.log.V(1).Info("Exec command finished", "command", redactedCommand)
+
+	if verbose {
+		a.log.Info("Exec command succeeded", "command", redactedCommand, "stdout", stdout, "stderr", stderr)
+	}
+
+	return
+}
+
+// Check if the Alluxio is ready by running `alluxio fsadmin report` command
+func (a AlluxioFileUtils) Ready() (ready bool) {
+	var (
+		command = []string{"alluxio", "fsadmin", "report"}
+		stdout  string
+		stderr  string
+	)
+
+	stdout, stderr, err := a.exec(command, true)
+	if err != nil {
+		a.log.Error(err, "AlluxioFileUtils.Ready() failed", "stdout", stdout, "stderr", stderr)
+		return
+	}
+
+	ready = true
+	return ready
+}
+
+// Get summary info of the Alluxio Engine
+func (a AlluxioFileUtils) ReportSummary() (summary string, err error) {
+	var (
+		command = []string{"alluxio", "fsadmin", "report", "summary"}
+		stdout  string
+		stderr  string
+	)
+
+	stdout, stderr, err = a.exec(command, false)
+	if err != nil {
+		a.log.Error(err, "AlluxioFileUtils.ReportSummary() failed", "stdout", stdout, "stderr", stderr)
+		return stdout, err
+	}
+	return stdout, err
+}
+
+// ReportMetrics get alluxio metrics by running `alluxio fsadmin report metrics` command
+func (a AlluxioFileUtils) ReportMetrics() (metrics string, err error) {
+	var (
+		command = []string{"alluxio", "fsadmin", "report", "metrics"}
+		stdout  string
+		stderr  string
+	)
+	stdout, stderr, err = a.exec(command, false)
+	if err != nil {
+		a.log.Error(err, "AlluxioFileUtils.ReportMetrics() failed", "stdout", stdout, "stderr", stderr)
+		return stdout, err
+	}
+	return stdout, err
+}
+
+// ReportCapacity get alluxio capacity info by running `alluxio fsadmin report capacity` command
+func (a AlluxioFileUtils) ReportCapacity() (report string, err error) {
+	var (
+		command = []string{"alluxio", "fsadmin", "report", "capacity"}
+		stdout  string
+		stderr  string
+	)
+	stdout, stderr, err = a.exec(command, false)
+	if err != nil {
+		a.log.Error(err, "AlluxioFileUtils.ReportCapacity() failed", "stdout", stdout, "stderr", stderr)
+		return stdout, err
+	}
+	return stdout, err
+}
+
+// Load the metadata without timeout
+func (a AlluxioFileUtils) LoadMetadataWithoutTimeout(alluxioPath string) (err error) {
+	var (
+		command = []string{"alluxio", "fs", "loadMetadata", "-R", alluxioPath}
+		stdout  string
+		stderr  string
+	)
+
+	start := time.Now()
+	stdout, stderr, err = a.exec(command, false)
+	duration := time.Since(start)
+	a.log.Info("Async Load Metadata took times to run", "period", duration)
+	if err != nil {
+		a.log.Error(err, "AlluxioFileUtils.LoadMetadataWithoutTimeout() failed", "stdout", stdout, "stderr", stderr)
+		return
+	} else {
+		a.log.Info("Async Load Metadata finished", "stdout", stdout)
+	}
+	return
+}
+
+/*
+MetadataInfoFile is a yaml file to save the metadata info of dataset, such as ufs total and fileNum
+it is in the form of：
+	dataset: <Dataset>
+	namespace: <Namespace>
+	ufstotal: <ufstotal>
+	filenum: <filenum>
+*/
+
+type KeyOfMetaDataFile string
+
+var (
+	DatasetName KeyOfMetaDataFile = "dataset"
+	Namespace   KeyOfMetaDataFile = "namespace"
+	UfsTotal    KeyOfMetaDataFile = "ufstotal"
+	FileNum     KeyOfMetaDataFile = "filenum"
+)
+
+// metaDataQueryCommand builds the argv used to read a single line out of the metadata info file.
+//
+// sed's script and the filename are kept as separate argv elements and are never joined into a
+// `bash -c` string. Quoting them into a shell script subjects the command to cmdguard's
+// shell-script validation, which rejects the single quotes a `sed -n '<line>' <file>` script
+// needs. A plain argv keeps the file name in its own element, so it reaches sed verbatim
+// without being reinterpreted.
+func metaDataQueryCommand(key KeyOfMetaDataFile, filename string) (command []string, err error) {
+	var line string
+	switch key {
+	case DatasetName:
+		line = "1p"
+	case Namespace:
+		line = "2p"
+	case UfsTotal:
+		line = "3p"
+	case FileNum:
+		line = "4p"
+	default:
+		return nil, errors.Errorf("the key %s is not in the metadatafile", key)
+	}
+	return []string{"sed", "-n", line, filename}, nil
+}
+
+// QueryMetaDataInfoIntoFile queries the metadata info file.
+func (a AlluxioFileUtils) QueryMetaDataInfoIntoFile(key KeyOfMetaDataFile, filename string) (value string, err error) {
+	command, err := metaDataQueryCommand(key, filename)
+	if err != nil {
+		a.log.Error(err, "unsupported metadata key", "key", key)
+		return
+	}
+	var (
+		stdout string
+		stderr string
+	)
+	stdout, stderr, err = a.exec(command, false)
+	if err != nil {
+		a.log.Error(err, "AlluxioFileUtils.QueryMetaDataInfoIntoFile() failed", "stdout", stdout, "stderr", stderr)
+		return
+	} else {
+		value = strings.TrimPrefix(stdout, string(key)+": ")
+	}
+	return
+}
+
+// ExecMountScripts executes the mount script located at /etc/fluid/scripts/mount.sh in the Alluxio master pod.
+// The script is mounted by the master statefulset and handles the mounting of storage backends to Alluxio.
+// It runs the script with verbose logging enabled to capture detailed execution output.
+// Returns an error if the script execution fails, otherwise returns nil indicating successful mount operation.
+func (a AlluxioFileUtils) ExecMountScripts() error {
+	var (
+		// Note: this script is mounted in master/statefulset.yaml
+		command = []string{"/etc/fluid/scripts/mount.sh"}
+		stdout  string
+		stderr  string
+	)
+	stdout, stderr, err := a.exec(command, true)
+	if err != nil {
+		a.log.Error(err, "AlluxioFileUtils.ExecMountScripts() failed", "stdout", stdout, "stderr", stderr)
+		return err
+	}
+	return nil
+}
+
+// Mount mounts a UFS path to an Alluxio path in the Alluxio filesystem by executing
+// the alluxio fs mount <alluxioPath> <ufsPath> command in the master pod container.
+//
+// Parameters:
+// - alluxioPath (string): The destination path in Alluxio namespace.
+// - ufsPath (string): The source UFS path to mount.
+// - options (map[string]string): Optional mount properties passed as --option key=value pairs.
+// - readOnly (bool): Forces the mount to be read-only when true.
+// - shared (bool): Enables cross-user sharing of the mount when true.
+//
+// Returns:
+// - err (error): Non-nil if the mount command fails or if executing the command returns an error.
+func (a AlluxioFileUtils) Mount(alluxioPath string,
+	ufsPath string,
+	options map[string]string,
+	readOnly bool,
+	shared bool) (err error) {
+
+	var (
+		command = []string{"alluxio", "fs", "mount"}
+		stderr  string
+		stdout  string
+	)
+
+	if readOnly {
+		command = append(command, "--readonly")
+	}
+
+	if shared {
+		command = append(command, "--shared")
+	}
+
+	for key, value := range options {
+		command = append(command, "--option", fmt.Sprintf("%s=%s", key, value))
+	}
+
+	command = append(command, alluxioPath, ufsPath)
+
+	stdout, stderr, err = a.exec(command, false)
+	if err != nil {
+		a.log.Error(err, "AlluxioFileUtils.Mount() failed", "stdout", stdout, "stderr", stderr)
+		return
+	}
+
+	return
+}
+
+func (a AlluxioFileUtils) UnMount(alluxioPath string) (err error) {
+	var (
+		command = []string{"alluxio", "fs", "unmount"}
+		stderr  string
+		stdout  string
+	)
+
+	command = append(command, alluxioPath)
+
+	stdout, stderr, err = a.exec(command, false)
+	if err != nil {
+		a.log.Error(err, "AlluxioFileUtils.UnMount() failed", "stdout", stdout, "stderr", stderr)
+		return
+	}
+
+	return
+}
+
+func (a AlluxioFileUtils) IsMounted(alluxioPath string) (mounted bool, err error) {
+	var (
+		command = []string{"alluxio", "fs", "mount"}
+		stdout  string
+		stderr  string
+	)
+
+	stdout, stderr, err = a.exec(command, true)
+	if err != nil {
+		a.log.Error(err, "AlluxioFileUtils.IsMounted() failed", "stdout", stdout, "stderr", stderr)
+		return mounted, err
+	}
+
+	results := strings.Split(stdout, "\n")
+
+	for _, line := range results {
+		fields := strings.Fields(line)
+		a.log.Info("parse output of isMounted", "alluxioPath", alluxioPath, "fields", fields)
+		if fields[2] == alluxioPath {
+			mounted = true
+			return mounted, nil
+		}
+	}
+
+	return mounted, err
+}
+
+// GetMountedAlluxioPaths returns all Alluxio paths that are currently mounted.
+// It executes the `alluxio fs mount` command in the Alluxio container, parses
+// the command output, and collects the Alluxio path field from each mount entry.
+//
+// Returns:
+// - []string: A list of mounted Alluxio paths.
+// - error: Non-nil if the mount command fails.
+func (a AlluxioFileUtils) GetMountedAlluxioPaths() ([]string, error) {
+	var (
+		command = []string{"alluxio", "fs", "mount"}
+		stdout  string
+		stderr  string
+	)
+
+	stdout, stderr, err := a.exec(command, true)
+	if err != nil {
+		a.log.Error(err, "AlluxioFileUtils.GetMountedAlluxioPaths() failed", "stdout", stdout, "stderr", stderr)
+		return []string{}, err
+	}
+
+	results := strings.Split(stdout, "\n")
+	var mountedPaths []string
+	for _, line := range results {
+		fields := strings.Fields(line)
+		mountedPaths = append(mountedPaths, fields[2])
+	}
+
+	return mountedPaths, err
+}
+
+// FindUnmountedAlluxioPaths returns the subset of the provided `alluxioPaths`
+// that are not currently mounted in the Alluxio filesystem. It retrieves the
+// current mounted paths via `GetMountedAlluxioPaths()` and computes the
+// difference using `utils.SubtractString`.
+//
+// Parameters:
+// - alluxioPaths: slice of Alluxio paths to check.
+//
+// Returns:
+// - []string: paths from `alluxioPaths` that are not mounted.
+// - error: non-nil if retrieving the list of mounted paths failed.
+func (a *AlluxioFileUtils) FindUnmountedAlluxioPaths(alluxioPaths []string) ([]string, error) {
+	mountedPaths, err := a.GetMountedAlluxioPaths()
+	if err != nil {
+		return []string{}, err
+	}
+
+	return utils.SubtractString(alluxioPaths, mountedPaths), err
+}
+
+// The count of the Alluxio Filesystem
+func (a AlluxioFileUtils) Count(alluxioPath string) (fileCount int64, folderCount int64, total int64, err error) {
+	var (
+		command                          = []string{"alluxio", "fs", "count", alluxioPath}
+		stdout                           string
+		stderr                           string
+		ufileCount, ufolderCount, utotal int64
+	)
+
+	stdout, stderr, err = a.exec(command, false)
+	if err != nil {
+		a.log.Error(err, "AlluxioFileUtils.Count() failed", "stdout", stdout, "stderr", stderr)
+		return
+	}
+
+	// [File Count Folder Count Total Bytes 1152 4 154262709011]
+	str := strings.Split(stdout, "\n")
+
+	if len(str) != 2 {
+		err = fmt.Errorf("failed to parse %s in Count method", str)
+		return
+	}
+
+	data := strings.Fields(str[1])
+	if len(data) != 3 {
+		err = fmt.Errorf("failed to parse %s in Count method", data)
+		return
+	}
+
+	ufileCount, err = strconv.ParseInt(data[0], 10, 64)
+	if err != nil {
+		return
+	}
+
+	ufolderCount, err = strconv.ParseInt(data[1], 10, 64)
+	if err != nil {
+		return
+	}
+
+	utotal, err = strconv.ParseInt(data[2], 10, 64)
+	if err != nil {
+		return
+	}
+
+	if ufileCount < 0 || ufolderCount < 0 || utotal < 0 {
+		err = fmt.Errorf("the return value of Count method is negative")
+		return
+	}
+
+	return ufileCount, ufolderCount, utotal, err
+}
+
+// file count of the Alluxio Filesystem (except folder)
+// use "alluxio fsadmin report metrics" for better performance
+func (a AlluxioFileUtils) GetFileCount() (fileCount int64, err error) {
+	args := []string{"alluxio", "fsadmin", "report", "metrics", "|", "grep", "Master.FilesCompleted"}
+	var (
+		command = []string{"bash", "-c", strings.Join(args, " ")}
+		stdout  string
+		stderr  string
+	)
+
+	stdout, stderr, err = a.exec(command, false)
+	if err != nil {
+		a.log.Error(err, "AlluxioFileUtils.GetFileCount() failed", "stdout", stdout, "stderr", stderr)
+		return
+	}
+
+	// eg: Master.FilesCompleted  (Type: COUNTER, Value: 6,367,897)
+	outStrWithoutComma := strings.Replace(stdout, ",", "", -1)
+	matchExp := regexp.MustCompile(`\d+`)
+	fileCountStr := matchExp.FindString(outStrWithoutComma)
+	fileCount, err = strconv.ParseInt(fileCountStr, 10, 64)
+	if err != nil {
+		return
+	}
+	return fileCount, nil
+}
+
+// MasterPodName gets the master pod name of the Alluxio cluster by parsing the output of `alluxio fsadmin report`.
+// This function is primarily responsible for executing the report command in the Alluxio container
+// and extracting the master address from the parsed output results.
+//
+// Returns:
+//   - masterPodName (string): The extracted master pod name or address. Returns the current pod name on failure.
+//   - err (error): Returns an error if the command execution fails or the output format is invalid.
+func (a AlluxioFileUtils) MasterPodName() (masterPodName string, err error) {
+	var (
+		command = []string{"alluxio", "fsadmin", "report"}
+		stdout  string
+		stderr  string
+	)
+	stdout, stderr, err = a.exec(command, true)
+	if err != nil {
+		a.log.Error(err, "AlluxioFileUtils.MasterPodName() failed", "stdout", stdout, "stderr", stderr)
+		return a.podName, err
+	}
+
+	redactedCommand := securityutils.FilterCommand(command)
+	str := strings.Split(stdout, "\n")
+	if len(str) < 1 {
+		message := fmt.Sprintf("get wrong result when using command %v", redactedCommand)
+		return a.podName, errors.New(message)
+	}
+
+	data := strings.Fields(str[1])
+	if len(data) < 2 {
+		message := fmt.Sprintf("get wrong result when using command %v", redactedCommand)
+		return a.podName, errors.New(message)
+	}
+	address := strings.Split(data[2], ":")[0]
+
+	return address, nil
+}
+
+// /////////// Unused Alluxio File Util Functions //////////////
+// LoadMetaData loads the metadata.
+func (a AlluxioFileUtils) LoadMetaData(alluxioPath string, sync bool) (err error) {
+	var (
+		// command = []string{"alluxio", "fs", "-Dalluxio.user.file.metadata.sync.interval=0", "ls", "-R", alluxioPath}
+		// command = []string{"alluxio", "fs", "-Dalluxio.user.file.metadata.sync.interval=0", "count", alluxioPath}
+		command []string
+		stdout  string
+		stderr  string
+	)
+
+	if sync {
+		command = []string{"alluxio", "fs", "-Dalluxio.user.file.metadata.sync.interval=0", "ls", "-R", alluxioPath}
+	} else {
+		command = []string{"alluxio", "fs", "ls", "-R", alluxioPath}
+	}
+
+	start := time.Now()
+	stdout, stderr, err = a.exec(command, false)
+	duration := time.Since(start)
+	a.log.Info("Load MetaData took times to run", "period", duration)
+	if err != nil {
+		a.log.Error(err, "AlluxioFileUtils.LoadMetaData() failed", "stdout", stdout, "stderr", stderr)
+		return
+	}
+
+	return
+}
+
+// Mkdir creates a directory in Alluxio at the specified path.
+// It executes the `alluxio fs mkdir <alluxioPath>` command inside the Alluxio pod's container.
+//
+// Parameters:
+// - alluxioPath (string): The Alluxio path to create.
+//
+// Returns:
+// - err (error): Non-nil if the mkdir command fails or if executing the command returns an error.
+func (a AlluxioFileUtils) Mkdir(alluxioPath string) (err error) {
+	var (
+		command = []string{"alluxio", "fs", "mkdir", alluxioPath}
+		stdout  string
+		stderr  string
+	)
+
+	stdout, stderr, err = a.exec(command, false)
+	if err != nil {
+		a.log.Error(err, "AlluxioFileUtils.Mkdir() failed", "stdout", stdout, "stderr", stderr)
+		return
+	}
+
+	return
+}
+
+// Du returns UFS size, cached size, and cache percentage for a path by running `alluxio fs du -s`.
+func (a AlluxioFileUtils) Du(alluxioPath string) (ufs int64, cached int64, cachedPercentage string, err error) {
+	var (
+		command = []string{"alluxio", "fs", "du", "-s", alluxioPath}
+		stdout  string
+		stderr  string
+	)
+
+	stdout, stderr, err = a.exec(command, false)
+	if err != nil {
+		a.log.Error(err, "AlluxioFileUtils.Du() failed", "stdout", stdout, "stderr", stderr)
+		return
+	}
+	str := strings.Split(stdout, "\n")
+
+	if len(str) != 2 {
+		err = fmt.Errorf("failed to parse %s in Du method", str)
+		return
+	}
+
+	data := strings.Fields(str[1])
+	if len(data) != 4 {
+		err = fmt.Errorf("failed to parse %s in Du method", data)
+		return
+	}
+
+	ufs, err = strconv.ParseInt(data[0], 10, 64)
+	if err != nil {
+		return
+	}
+
+	cached, err = strconv.ParseInt(data[1], 10, 64)
+	if err != nil {
+		return
+	}
+
+	cachedPercentage = strings.TrimLeft(data[2], "(")
+	cachedPercentage = strings.TrimRight(cachedPercentage, ")")
+
+	return
+}

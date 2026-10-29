@@ -1,0 +1,212 @@
+/*
+Copyright 2023 The Fluid Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package kubeclient
+
+import (
+	"context"
+	"fmt"
+	"github.com/fluid-cloudnative/fluid/pkg/common"
+
+	"github.com/fluid-cloudnative/fluid/pkg/utils"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+	v1 "k8s.io/api/core/v1"
+
+	apierrs "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+)
+
+// IsConfigMapExist checks if the configMap exists given its name and namespace.
+func IsConfigMapExist(client client.Client, name, namespace string) (found bool, err error) {
+	return IsConfigMapExistWithContext(context.TODO(), client, name, namespace)
+}
+
+// IsConfigMapExistWithContext checks if the configMap exists given its name and namespace with the caller context.
+func IsConfigMapExistWithContext(ctx context.Context, client client.Client, name, namespace string) (found bool, err error) {
+	key := types.NamespacedName{
+		Name:      name,
+		Namespace: namespace,
+	}
+
+	cm := &v1.ConfigMap{}
+
+	if err = client.Get(ctx, key, cm); err != nil {
+		if apierrs.IsNotFound(err) {
+			found = false
+			err = nil
+		}
+	} else {
+		found = true
+	}
+	return found, err
+}
+
+// GetConfigmapByName gets configmap with given name and namespace of the configmap.
+func GetConfigmapByName(client client.Client, name, namespace string) (configmap *v1.ConfigMap, err error) {
+	return GetConfigmapByNameWithContext(context.TODO(), client, name, namespace)
+}
+
+// GetConfigmapByNameWithContext gets configmap with given name and namespace of the configmap with the caller context.
+func GetConfigmapByNameWithContext(ctx context.Context, client client.Client, name, namespace string) (configmap *v1.ConfigMap, err error) {
+	key := types.NamespacedName{
+		Name:      name,
+		Namespace: namespace,
+	}
+
+	configmap = &v1.ConfigMap{}
+
+	if err = client.Get(ctx, key, configmap); err != nil {
+		if apierrs.IsNotFound(err) {
+			err = nil
+			configmap = nil
+		}
+		return configmap, err
+	}
+
+	return
+}
+
+// DeleteConfigMap deletes the configmap given its name and namespace if the configmap exists.
+func DeleteConfigMap(client client.Client, name, namespace string) (err error) {
+	return DeleteConfigMapWithContext(context.TODO(), client, name, namespace)
+}
+
+// DeleteConfigMapWithContext deletes the configmap given its name and namespace if the configmap exists.
+func DeleteConfigMapWithContext(ctx context.Context, client client.Client, name, namespace string) (err error) {
+	key := types.NamespacedName{
+		Name:      name,
+		Namespace: namespace,
+	}
+	found := false
+
+	cm := &v1.ConfigMap{}
+	if err = client.Get(ctx, key, cm); err != nil {
+		if apierrs.IsNotFound(err) {
+			log.V(1).Info("Skip deleting the configmap because it was not found", "name", name,
+				"namespace", namespace)
+			found = false
+			err = nil
+		} else {
+			return err
+		}
+	} else {
+		found = true
+	}
+	if found {
+		err = client.Delete(ctx, cm)
+	}
+
+	return err
+}
+
+func CopyConfigMap(client client.Client, src types.NamespacedName, dst types.NamespacedName, reference metav1.OwnerReference) error {
+	return CopyConfigMapWithContext(context.TODO(), client, src, dst, reference)
+}
+
+func CopyConfigMapWithContext(ctx context.Context, client client.Client, src types.NamespacedName, dst types.NamespacedName, reference metav1.OwnerReference) error {
+	found, err := IsConfigMapExistWithContext(ctx, client, dst.Name, dst.Namespace)
+	if err != nil {
+		return err
+	}
+	if found {
+		return nil
+	}
+
+	// copy configmap
+	srcConfigMap, err := GetConfigmapByNameWithContext(ctx, client, src.Name, src.Namespace)
+	if err != nil {
+		return err
+	}
+	// if the source dataset configmap not found, return error and requeue
+	if srcConfigMap == nil {
+		return fmt.Errorf("runtime configmap %v do not exist", src)
+	}
+	// create the virtual dataset configmap if not exist
+	copiedConfigMap := srcConfigMap.DeepCopy()
+
+	dstConfigMap := &v1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            dst.Name,
+			Namespace:       dst.Namespace,
+			Labels:          copiedConfigMap.Labels,
+			Annotations:     copiedConfigMap.Annotations,
+			OwnerReferences: []metav1.OwnerReference{reference},
+		},
+		Data: copiedConfigMap.Data,
+	}
+
+	if dstConfigMap.Labels == nil {
+		dstConfigMap.Labels = make(map[string]string)
+	}
+	dstConfigMap.Labels[common.LabelAnnotationDatasetId] = utils.GetDatasetId(dst.Namespace, dst.Name, string(reference.UID))
+
+	err = client.Create(ctx, dstConfigMap)
+	if err != nil {
+		if otherErr := utils.IgnoreAlreadyExists(err); otherErr != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func UpdateConfigMap(client client.Client, cm *v1.ConfigMap) error {
+	return UpdateConfigMapWithContext(context.TODO(), client, cm)
+}
+
+func UpdateConfigMapWithContext(ctx context.Context, client client.Client, cm *v1.ConfigMap) error {
+	err := client.Update(ctx, cm)
+	return err
+}
+
+func CreateConfigMap(client client.Client, name string, namespace string, key string, data []byte, ownerDatasetId string) (err error) {
+	return CreateConfigMapWithContext(context.TODO(), client, name, namespace, key, data, ownerDatasetId)
+}
+
+func CreateConfigMapWithContext(ctx context.Context, client client.Client, name string, namespace string, key string, data []byte, ownerDatasetId string) (err error) {
+	configMap := &v1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: namespace,
+			Labels: map[string]string{
+				common.LabelAnnotationDatasetId: ownerDatasetId,
+			},
+		},
+		Data: map[string]string{
+			key: string(data),
+		},
+	}
+
+	return client.Create(ctx, configMap)
+}
+
+func CreateConfigMapWithOwner(client client.Client, name string, namespace string, data map[string]string, ownerReference []metav1.OwnerReference) (err error) {
+	return CreateConfigMapWithOwnerWithContext(context.TODO(), client, name, namespace, data, ownerReference)
+}
+
+func CreateConfigMapWithOwnerWithContext(ctx context.Context, client client.Client, name, namespace string, data map[string]string, ownerReference []metav1.OwnerReference) (err error) {
+	configMap := &v1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            name,
+			Namespace:       namespace,
+			OwnerReferences: ownerReference,
+		},
+		Data: data,
+	}
+
+	return client.Create(ctx, configMap)
+}

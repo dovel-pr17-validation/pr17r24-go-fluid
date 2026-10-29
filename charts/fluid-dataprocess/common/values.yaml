@@ -1,0 +1,34 @@
+name: ""
+
+owner:
+  enabled: false
+  name: ""
+  kind: ""
+  uid: ""
+  apiVersion: ""
+  blockOwnerDeletion: false
+  controller: false
+
+dataProcess:
+  # policy for DataProcess: Once, Cron, OnEvent
+  policy: ""
+  # schedule for cron policy, see https://en.wikipedia.org/wiki/Cron
+  schedule: ""
+  targetDataset: ""
+  labels: {}
+  annotations: {}
+  serviceAccountName: ""
+  scriptProcessor:
+    image: ""
+    imagePullPolicy: IfNotPresent
+    restartPolicy: Never
+    command: []
+    args: []
+    source: ""
+    envs: []
+    volumes: []
+    volumeMounts: []
+    resources: {}
+    affinity: {}
+  jobProcessor:
+    podSpec: {}

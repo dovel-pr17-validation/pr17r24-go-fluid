@@ -1,0 +1,23 @@
+# To get started with Dependabot version updates, you'll need to specify which
+# package ecosystems to update and where the package manifests are located.
+# Please see the documentation for all configuration options:
+# https://help.github.com/github/administering-a-repository/configuration-options-for-dependency-updates
+
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      # Bump every github/codeql-action/* step (init, analyze, autobuild,
+      # upload-sarif) together. They must run on the same version, otherwise
+      # analysis fails with "Loaded a configuration file for version X, but
+      # running version Y".
+      codeql-action:
+        patterns:
+          - "github/codeql-action*"
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: daily

@@ -1,0 +1,192 @@
+/*
+Copyright 2023 The Fluid Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package jindocache
+
+import (
+	"context"
+	"fmt"
+	"regexp"
+	"strconv"
+	"strings"
+
+	datav1alpha1 "github.com/fluid-cloudnative/fluid/api/v1alpha1"
+	"github.com/fluid-cloudnative/fluid/pkg/common"
+	"github.com/fluid-cloudnative/fluid/pkg/ddc/jindocache/operations"
+	"github.com/fluid-cloudnative/fluid/pkg/utils"
+	"k8s.io/apimachinery/pkg/types"
+)
+
+func (e *JindoCacheEngine) getTieredStoreType(runtime *datav1alpha1.JindoRuntime) int {
+	var mediumType int
+	for _, level := range runtime.Spec.TieredStore.Levels {
+		mediumType = common.GetDefaultTieredStoreOrder(level.MediumType)
+	}
+	return mediumType
+}
+
+func (e *JindoCacheEngine) hasTieredStore(runtime *datav1alpha1.JindoRuntime) bool {
+	return len(runtime.Spec.TieredStore.Levels) > 0
+}
+
+func (e *JindoCacheEngine) getMountPoint() (mountPath string) {
+	mountRoot := getMountRoot()
+	e.Log.Info("mountRoot", "path", mountRoot)
+	return fmt.Sprintf("%s/%s/%s/jindofs-fuse", mountRoot, e.namespace, e.name)
+}
+
+func (j *JindoCacheEngine) getHostMountPoint() (mountPath string) {
+	mountRoot := getMountRoot()
+	j.Log.Info("mountRoot", "path", mountRoot)
+	return fmt.Sprintf("%s/%s/%s", mountRoot, j.namespace, j.name)
+}
+
+// getMountRoot returns the default path, if it's not set
+func getMountRoot() (path string) {
+	path, err := utils.GetMountRoot()
+	if err != nil {
+		path = "/" + common.JindoRuntime
+	} else {
+		path = path + "/" + common.JindoRuntime
+	}
+	// e.Log.Info("Mount root", "path", path)
+	return
+}
+
+// getRuntime gets the jindo runtime
+func (e *JindoCacheEngine) getRuntime() (*datav1alpha1.JindoRuntime, error) {
+
+	key := types.NamespacedName{
+		Name:      e.name,
+		Namespace: e.namespace,
+	}
+
+	var runtime datav1alpha1.JindoRuntime
+	if err := e.Get(context.TODO(), key, &runtime); err != nil {
+		return nil, err
+	}
+	return &runtime, nil
+}
+
+func (e *JindoCacheEngine) getMasterName() (dsName string) {
+	return e.name + "-jindofs-master"
+}
+
+func (e *JindoCacheEngine) getWorkerName() (dsName string) {
+	return e.name + "-jindofs-worker"
+}
+
+func (e *JindoCacheEngine) getFuseName() (dsName string) {
+	return e.name + "-jindofs-fuse"
+}
+
+func (e *JindoCacheEngine) getMasterPodInfo() (podName string, containerName string) {
+	podName = e.name + "-jindofs-master-0"
+	containerName = "jindofs-master"
+
+	return
+}
+
+// return total storage size of Jindo in bytes
+func (e *JindoCacheEngine) TotalJindoStorageBytes() (value int64, err error) {
+	podName, containerName := e.getMasterPodInfo()
+	fileUtils := operations.NewJindoFileUtils(podName, containerName, e.namespace, e.Log)
+	dataset, err := utils.GetDataset(e.Client, e.name, e.namespace)
+	if err != nil {
+		return 0, err
+	}
+
+	ufsSize := int64(0)
+	for _, mount := range dataset.Spec.Mounts {
+		// e.g. jindo:// + /mybucket -> jindo:///mybucket
+		mountPath := "jindo://" + utils.UFSPathBuilder{}.GenUFSPathInUnifiedNamespace(mount)
+		mountPathSize, err := fileUtils.GetUfsTotalSize(mountPath)
+		if err != nil {
+			e.Log.Error(err, "get total size with path error", "mountPath", mountPath)
+			continue
+		}
+		mountSize, err := strconv.ParseInt(mountPathSize, 10, 64)
+		if err != nil {
+			e.Log.Error(err, "ParseInt with mount size failed", "mountPathSize", mountPathSize)
+			continue
+		}
+		e.Log.V(1).Info("calculated jindocache storage ufs size for the mount path", "mountPathSize", utils.BytesSize(float64(mountSize)), "mountPath", mountPath)
+		ufsSize += mountSize
+	}
+	e.Log.Info("calculated total ufs size of jindocache storage", "total ufs size", utils.BytesSize(float64(ufsSize)))
+	return ufsSize, err
+}
+
+type jindoVersion struct {
+	Major int
+	Minor int
+	Patch int
+	Tag   string
+}
+
+func (version *jindoVersion) compare(other jindoVersion) int {
+	if version.Major < other.Major {
+		return -1
+	} else if version.Major > other.Major {
+		return 1
+	}
+
+	if version.Minor < other.Minor {
+		return -1
+	} else if version.Minor > other.Minor {
+		return 1
+	}
+
+	if version.Patch < other.Patch {
+		return -1
+	} else if version.Patch > other.Patch {
+		return 1
+	}
+
+	return 0
+}
+
+func parseVersionFromImageTag(imageTag string) (jindoVersion, error) {
+	re := regexp.MustCompile(`^v?(\d+)\.(\d+)\.(\d+)(?:-(.+))?$`)
+	matches := re.FindStringSubmatch(strings.TrimSpace(imageTag))
+	// expected length of matches is 4 or 5
+	if len(matches) < 4 || len(matches) > 5 {
+		return jindoVersion{}, fmt.Errorf("invalid image tag \"%s\"", imageTag)
+	}
+	major, err := strconv.Atoi(matches[1])
+	if err != nil {
+		return jindoVersion{}, fmt.Errorf("invalid major version from image tag \"%s\": %v", imageTag, err)
+	}
+	minor, err := strconv.Atoi(matches[2])
+	if err != nil {
+		return jindoVersion{}, fmt.Errorf("invalid minor version from image tag \"%s\": %v", imageTag, err)
+	}
+	patch, err := strconv.Atoi(matches[3])
+	if err != nil {
+		return jindoVersion{}, fmt.Errorf("invalid patch version from image tag \"%s\": %v", imageTag, err)
+	}
+	var tag string
+	if len(matches) >= 5 {
+		tag = matches[4]
+	}
+
+	return jindoVersion{
+		Major: major,
+		Minor: minor,
+		Patch: patch,
+		Tag:   tag,
+	}, nil
+}

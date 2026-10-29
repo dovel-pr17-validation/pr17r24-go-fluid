@@ -1,0 +1,138 @@
+/*
+Copyright 2023 The Fluid Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package poststart
+
+import (
+	"strings"
+
+	corev1 "k8s.io/api/core/v1"
+)
+
+// const (
+// 	configMapName             = "check-mount"
+// 	unprivilegedConfigMapName = configMapName + "-unprivileged"
+// 	scriptName                = configMapName + ".sh"
+// 	scriptPath                = "/" + scriptName
+// )
+
+// The standard error returned from the execution of the postStartHook
+// will appear in the kubelet logs to clarify the reason for the PostStartHook.
+var (
+	replacer                 = strings.NewReplacer("¬", "`")
+	contentPrivilegedSidecar = `#!/bin/bash
+
+set -e
+
+redirect_output_with_retry() {
+    local n=0
+    local try=5
+
+    while [[ $try -gt $n ]]; do
+        if exec 1>>/proc/1/fd/1 2>&1; then
+            return 0
+        else
+            n=$((n + 1))
+            sleep 1
+        fi
+    done
+
+	echo "[PostStartHook] Redirection failed" >&2
+    return 125
+}
+
+redirect_output_with_retry
+
+function log() {
+	msg=$1
+	echo -e ">>> $(date '+%Y-%m-%d %H:%M:%S') fluid-post-start-check $msg"
+}
+
+ConditionPathIsMountPoint="$1"
+MountType="$2"
+SubPath="$3"
+
+# grep /dev/fuse if the mountType equals to jindo
+if [[ "$MountType" == "jindo" ]]; then
+  MountType=/dev/fuse
+fi
+
+count=1
+limit=30
+while ! cat /proc/self/mountinfo | grep -F "$ConditionPathIsMountPoint" | grep -F "$MountType"
+do
+    sleep 1
+    count=¬expr $count + 1¬
+    if test $count -eq $limit
+    then
+        log "timed out checking mount point for $limit seconds!"
+        exit 1
+    fi
+done
+
+# different with csi, as here the mount point is the parent dir of the fuse mount point, 
+subpath_check_count=1
+subpath_check_limit=30
+while ! ls -d "$ConditionPathIsMountPoint"/*/"$SubPath" >/dev/null 2>&1
+do
+    sleep 1
+    subpath_check_count=¬expr $subpath_check_count + 1¬
+    if test $subpath_check_count -eq $subpath_check_limit
+    then
+        log "timed out checking sub path [$SubPath] for $subpath_check_limit seconds!"
+        exit 2
+    fi
+done
+
+log "succeed in checking mount point $ConditionPathIsMountPoint after $count attempts"
+`
+)
+
+// defaultPrivilegedSidecarScriptSHA256 stores the SHA256 (first 63 chars) of the privileged
+// sidecar script content, computed once at package initialization.
+var defaultPrivilegedSidecarScriptSHA256 string
+
+func init() {
+	defaultPrivilegedSidecarScriptSHA256 = computeScriptSHA256(replacer.Replace(contentPrivilegedSidecar))
+}
+
+// DefaultMountCheckScriptGenerator is a generator to render resources and specs related to post start mount-check script for the DefaultMutator
+type defaultPostStartScriptGenerator struct {
+	scriptGeneratorHelper
+}
+
+func NewDefaultPostStartScriptGenerator() *defaultPostStartScriptGenerator {
+	return &defaultPostStartScriptGenerator{
+		scriptGeneratorHelper: scriptGeneratorHelper{
+			configMapName:   "default-check-mount",
+			scriptFileName:  "check-mount.sh",
+			scriptMountPath: "/check-mount.sh",
+			scriptContent:   replacer.Replace(contentPrivilegedSidecar),
+			scriptSHA256:    defaultPrivilegedSidecarScriptSHA256,
+		},
+	}
+}
+
+func (g *defaultPostStartScriptGenerator) GetPostStartCommand(mountPath, mountType, subPath string) (handler *corev1.LifecycleHandler) {
+	// https://github.com/kubernetes/kubernetes/issues/25766
+	// Arguments are passed as positional parameters so that user-controlled values (e.g. subPath)
+	// are never re-parsed by the shell.
+	cmd := []string{"bash", "-c", `time "$0" "$@"`, g.scriptMountPath, mountPath, mountType, subPath}
+
+	return &corev1.LifecycleHandler{
+		Exec: &corev1.ExecAction{Command: cmd},
+	}
+}

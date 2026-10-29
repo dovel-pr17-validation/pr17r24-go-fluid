@@ -1,0 +1,129 @@
+#!/bin/bash
+
+testname="juicefsruntime basic e2e"
+
+dataset_name="jfsdemo"
+write_job_name="write-job"
+read_job_name="read-job"
+
+function syslog() {
+    echo ">>> $1"
+}
+
+function panic() {
+    err_msg=$1
+    syslog "test \"$testname\" failed: $err_msg"
+    exit 1
+}
+
+function setup_redis() {
+    kubectl create -f test/gha-e2e/juicefs/redis.yaml
+}
+
+function setup_minio() {
+    kubectl create -f test/gha-e2e/juicefs/minio.yaml
+}
+
+function create_dataset() {
+    kubectl create -f test/gha-e2e/juicefs/dataset.yaml
+
+    if [[ -z "$(kubectl get dataset $dataset_name -oname)" ]]; then
+        panic "failed to create dataset $dataset_name"
+    fi
+
+    if [[ -z "$(kubectl get juicefsruntime $dataset_name -oname)" ]]; then
+        panic "failed to create juicefsruntime $dataset_name"
+    fi
+}
+
+function wait_dataset_bound() {
+    deadline=180 # 3 minutes
+    last_state=""
+    log_interval=0
+    log_times=0
+    while true; do
+        last_state=$(kubectl get dataset $dataset_name -ojsonpath='{@.status.phase}')
+        if [[ $log_interval -eq 3 ]]; then
+            log_times=$(expr $log_times + 1)
+            syslog "checking dataset.status.phase==Bound (already $(expr $log_times \* $log_interval \* 5)s, last state: $last_state)"
+            if [[ "$(expr $log_times \* $log_interval \* 5)" -ge "$deadline" ]]; then
+                panic "timeout for ${deadline}s!"
+            fi
+            log_interval=0
+        fi
+
+        if [[ "$last_state" == "Bound" ]]; then
+            break
+        fi
+        log_interval=$(expr $log_interval + 1)
+        sleep 5
+    done
+    syslog "Found dataset $dataset_name status.phase==Bound"
+}
+
+function create_job() {
+    job_file=$1
+    job_name=$2
+    kubectl create -f $job_file
+
+    if [[ -z "$(kubectl get job $job_name -oname)" ]]; then
+        panic "failed to create job $job_name"
+    fi
+}
+
+function wait_job_completed() {
+    job_name=$1
+    while true; do
+        succeed=$(kubectl get job $job_name -ojsonpath='{@.status.succeeded}')
+        failed=$(kubectl get job $job_name -ojsonpath='{@.status.failed}')
+        if [[ "$failed" -ne "0" ]]; then
+            panic "job failed when accessing data"
+        fi
+        if [[ "$succeed" -eq "1" ]]; then
+            break
+        fi
+        sleep 5
+    done
+    syslog "Found succeeded job $job_name"
+}
+
+function dump_env_and_clean_up() {
+    local exit_code=$?
+    if [[ $exit_code -ne 0 ]]; then
+        bash tools/diagnose-fluid-juicefs.sh collect --name $dataset_name --namespace default --collect-path ./e2e-tmp/testcase-juicefs.tgz
+        syslog "=== Diagnostic logs for failed test ==="
+        syslog "--- juicefsruntime-controller logs (last 100 lines) ---"
+        kubectl logs -n fluid-system -l control-plane=juicefsruntime-controller -c manager --tail=100 2>&1 || true
+        syslog "--- JuiceFSRuntime describe ---"
+        kubectl describe juicefsruntime $dataset_name 2>&1 || true
+        syslog "--- Dataset describe ---"
+        kubectl describe dataset $dataset_name 2>&1 || true
+        syslog "--- Pods in default namespace ---"
+        kubectl get pods -n default -owide 2>&1 || true
+        syslog "--- Events in default namespace ---"
+        kubectl get events -n default --sort-by='.lastTimestamp' 2>&1 || true
+        syslog "=== End of diagnostic logs ==="
+    fi
+    syslog "Cleaning up resources for testcase $testname"
+    kubectl delete -f test/gha-e2e/juicefs/read_job.yaml
+    kubectl delete -f test/gha-e2e/juicefs/write_job.yaml 
+    kubectl delete -f test/gha-e2e/juicefs/dataset.yaml 
+    kubectl delete -f test/gha-e2e/juicefs/minio.yaml
+    kubectl delete -f test/gha-e2e/juicefs/redis.yaml
+}
+
+function main() {
+    syslog "[TESTCASE $testname STARTS AT $(date)]"
+    setup_redis
+    setup_minio
+    create_dataset
+    trap dump_env_and_clean_up EXIT
+    wait_dataset_bound
+    create_job test/gha-e2e/juicefs/write_job.yaml $write_job_name
+    wait_job_completed $write_job_name
+    create_job test/gha-e2e/juicefs/read_job.yaml $read_job_name
+    wait_job_completed $read_job_name
+    syslog "[TESTCASE $testname SUCCEEDED AT $(date)]"
+}
+
+main

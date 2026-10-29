@@ -1,0 +1,15 @@
+apiVersion: data.fluid.io/v1alpha1
+kind: ThinRuntimeProfile
+metadata:
+  name: ossfs-profile
+spec:
+  fileSystemType: ossfs
+  fuse:
+    image: <IMG_REPO>/ossfs-dynamic-mount
+    imageTag: v1.0
+    imagePullPolicy: IfNotPresent
+    command:
+    - "tini"
+    - "-g"
+    - "--"
+    - "/usr/local/bin/entrypoint.sh"

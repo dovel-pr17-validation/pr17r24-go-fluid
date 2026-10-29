@@ -1,0 +1,250 @@
+/*
+Copyright 2020 The Fluid Author.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package alluxio
+
+import (
+	"fmt"
+	datav1alpha1 "github.com/fluid-cloudnative/fluid/api/v1alpha1"
+	"github.com/fluid-cloudnative/fluid/pkg/ddc/alluxio/operations"
+	"github.com/fluid-cloudnative/fluid/pkg/utils"
+	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"os"
+)
+
+// IsMountWithConfigMap checks if the mount configuration is stored in a ConfigMap.
+// It looks up the environment variable MountConfigStorage and compares it to ConfigmapStorageName.
+// If the environment variable is set, it returns whether it matches ConfigmapStorageName; otherwise, it returns the default value true.
+func IsMountWithConfigMap() bool {
+	if envVal, exists := os.LookupEnv(MountConfigStorage); exists {
+		return envVal == ConfigmapStorageName
+	}
+	// default value
+	return true
+}
+
+// UsedStorageBytes returns used storage size of Alluxio in bytes
+func (e *AlluxioEngine) UsedStorageBytes() (value int64, err error) {
+	// return e.usedStorageBytesInternal()
+	return e.usedStorageBytesInternal()
+}
+
+// FreeStorageBytes returns free storage size of Alluxio in bytes
+func (e *AlluxioEngine) FreeStorageBytes() (value int64, err error) {
+	// return e.freeStorageBytesInternal()
+	return e.freeStorageBytesInternal()
+}
+
+// TotalStorageBytes returns total storage size of Alluxio in bytes
+func (e *AlluxioEngine) TotalStorageBytes() (value int64, err error) {
+	// return e.totalStorageBytesInternal()
+	return e.totalStorageBytesInternal()
+}
+
+// TotalFileNums returns the total num of files in Alluxio
+func (e *AlluxioEngine) TotalFileNums() (value int64, err error) {
+	// return e.totalFileNumsInternal()
+	return e.totalFileNumsInternal()
+}
+
+// ShouldCheckUFS checks if it requires checking UFS
+func (e *AlluxioEngine) ShouldCheckUFS() (should bool, err error) {
+	// For Alluxio Engine, always attempt to prepare UFS
+	should = true
+	return
+}
+
+// PrepareUFS does all the UFS preparations
+func (e *AlluxioEngine) PrepareUFS() (err error) {
+	// if using configmap to store mount info, no need to execute ufs mount in alluxio master pod in `Setup` phase.
+	usingConfigMap := IsMountWithConfigMap()
+	if !usingConfigMap {
+		// 1. Mount UFS (Synchronous Operation)
+		shouldMountUfs, err := e.shouldMountUFS()
+		if err != nil {
+			return err
+		}
+		e.Log.Info("shouldMountUFS", "should", shouldMountUfs)
+
+		if shouldMountUfs {
+			err = e.mountUFS()
+			if err != nil {
+				return err
+			}
+		}
+		e.Log.Info("mountUFS")
+	} else {
+		// for multiple master, can not use startup probe/post start, mount in the controller.
+		runtime, err := e.getRuntime()
+		if err != nil {
+			return err
+		}
+		replicas := runtime.Spec.Master.Replicas
+		if replicas > 1 {
+			// Mount UFS (Synchronous Operation)
+			podName, containerName := e.getMasterPodInfo()
+			fileUtils := operations.NewAlluxioFileUtils(podName, containerName, e.namespace, e.Log)
+			err = fileUtils.ExecMountScripts()
+			if err != nil {
+				return err
+			}
+			e.Log.Info("mountUFS for ha master")
+		}
+	}
+
+	err = e.SyncMetadata()
+	if err != nil {
+		// just report this error and ignore it because SyncMetadata isn't on the critical path of Setup
+		e.Log.Error(err, "SyncMetadata")
+		return nil
+	}
+
+	return
+}
+
+// ShouldUpdateUFS determines whether the UFS configuration needs to be updated.
+// It retrieves the current dataset, analyzes the path differences to identify
+// which UFS entries require updates, and checks whether remounting is needed
+// for hostpath UFS mounts before returning the update result.
+func (e *AlluxioEngine) ShouldUpdateUFS() (ufsToUpdate *utils.UFSToUpdate) {
+	// 1. get the dataset
+	dataset, err := utils.GetDataset(e.Client, e.name, e.namespace)
+	if err != nil {
+		e.Log.Error(err, "Failed to get the dataset")
+		return
+	}
+
+	// 2.get the ufs to update
+	ufsToUpdate = utils.NewUFSToUpdate(dataset)
+	ufsToUpdate.AnalyzePathsDelta()
+
+	// 3. for hostpath ufs mount, check if all mountpoints have been mounted
+	e.checkIfRemountRequired(ufsToUpdate)
+
+	return
+}
+
+// UpdateOnUFSChange handles the updates when the Underlying File System (UFS) changes.
+// It checks if an update is required, sets the dataset status to Updating, and processes
+// the added or removed mount points for the Alluxio engine.
+//
+// Parameters:
+// - ufsToUpdate (*utils.UFSToUpdate): The object containing information about which UFS paths need to be updated.
+//
+// Returns:
+// - updateReady (bool): Returns true when the update process has completed.
+// - err (error): Returns an error if the status update or UFS processing fails, otherwise returns nil.
+func (e *AlluxioEngine) UpdateOnUFSChange(ufsToUpdate *utils.UFSToUpdate) (updateReady bool, err error) {
+	// 1. check if need to update ufs
+	if !ufsToUpdate.ShouldUpdate() {
+		e.Log.Info("no need to update ufs",
+			"namespace", e.namespace,
+			"name", e.name)
+		return
+	}
+
+	// 2. set update status to updating
+	err = utils.UpdateMountStatus(e.Client, e.name, e.namespace, datav1alpha1.UpdatingDatasetPhase)
+	if err != nil {
+		e.Log.Error(err, "Failed to update dataset status to updating")
+		return
+	}
+
+	// 3. process added and removed
+	updateReady, err = e.processUpdatingUFS(ufsToUpdate)
+	if err != nil {
+		e.Log.Error(err, "Failed to add or remove mount points")
+		return
+	}
+
+	return
+}
+
+// checkIfRemountRequired checks whether a remount operation is needed for the given UFS.
+// It compares the runtime's MountTime with the Alluxio master container's start time.
+// If the master container started after the last mount, the in-memory mount state may not
+// have survived the restart, so it finds unmounted UFS paths and adds them to ufsToUpdate
+// for remount scheduling. If no paths need remounting, it refreshes the runtime's MountTime
+// to prevent the check from re-firing on every reconcile.
+//
+// Parameters:
+//   - ufsToUpdate (*utils.UFSToUpdate): An in/out parameter that may be mutated via
+//     AddMountPaths to carry unmounted paths back to the caller for remount scheduling.
+func (e *AlluxioEngine) checkIfRemountRequired(ufsToUpdate *utils.UFSToUpdate) {
+	runtime, err := e.getRuntime()
+	if err != nil {
+		e.Log.Error(err, "checkIfRemountRequired", "runtime", e.name)
+		return
+	}
+
+	masterPodName, masterContainerName := e.getMasterPodInfo()
+	masterPod, err := e.getMasterPod(masterPodName, e.namespace)
+	if err != nil {
+		e.Log.Error(err, "checkIfRemountRequired", "master pod", e.name)
+		return
+	}
+
+	var startedAt *v1.Time
+	for _, containerStatus := range masterPod.Status.ContainerStatuses {
+		if containerStatus.Name == masterContainerName {
+			if containerStatus.State.Running == nil {
+				e.Log.Error(fmt.Errorf("container is not running"), "checkIfRemountRequired", "master pod", masterPodName)
+				return
+			} else {
+				startedAt = &containerStatus.State.Running.StartedAt
+				break
+			}
+		}
+	}
+
+	// If mounttime is earlier than master container starttime, remount is necessary
+	if startedAt != nil && runtime.Status.MountTime != nil && runtime.Status.MountTime.Before(startedAt) {
+		e.Log.Info("remount on master restart", "alluxioruntime", e.name)
+
+		unmountedPaths, err := e.FindUnmountedUFS()
+		if err != nil {
+			e.Log.Error(err, "Failed in finding unmounted ufs")
+			return
+		}
+
+		if len(unmountedPaths) != 0 {
+			ufsToUpdate.AddMountPaths(unmountedPaths)
+		} else {
+			// if no path can be mounted, set mountTime to be now
+			e.updateMountTime()
+		}
+	}
+}
+
+// ShouldSyncDatasetMounts checks whether the dataset mounts need to be synchronized in the AlluxioEngine.
+// This function is primarily responsible for determining if there are any changes to the dataset's mount points
+// that require synchronization with the underlying Alluxio runtime, such as new mounts, removed mounts, or updates
+// to existing mount configurations.
+//
+// Parameters:
+//
+// Returns:
+//   - should (bool): A boolean indicating whether a synchronization of dataset mounts is necessary.
+//   - err (error): Returns an error if the check process fails, otherwise returns nil.
+func (e *AlluxioEngine) ShouldSyncDatasetMounts() (should bool, err error) {
+	return false, nil
+}
+
+// SyncDatasetMounts is a no-op for the Alluxio engine.
+// Mount synchronization is not currently required for Alluxio runtimes.
+func (e *AlluxioEngine) SyncDatasetMounts() (err error) {
+	return nil
+}

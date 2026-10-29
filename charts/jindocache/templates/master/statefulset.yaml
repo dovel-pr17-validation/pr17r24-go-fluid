@@ -1,0 +1,248 @@
+{{- $masterCount := int .Values.master.replicaCount }}
+{{- $isSingleMaster := eq $masterCount 1 }}
+{{- $isRaftHa := eq $masterCount 3 }}
+{{- $notEnableDnsConfig := (eq .Values.master.dnsServer "1.1.1.1") }}
+
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ template "jindofs.fullname" . }}-master
+  labels:
+    name: {{ template "jindofs.fullname" . }}-master
+    app: {{ template "jindofs.name" . }}
+    chart: {{ template "jindofs.chart" . }}
+    release: {{ .Release.Name }}
+    heritage: {{ .Release.Service }}
+    role: jindofs-master
+    {{- include "library.fluid.labels" . | nindent 4 }}
+  ownerReferences:
+  {{- if .Values.owner.enabled }}
+  - apiVersion: {{ .Values.owner.apiVersion }}
+    blockOwnerDeletion: {{ .Values.owner.blockOwnerDeletion }}
+    controller: {{ .Values.owner.controller }}
+    kind: {{ .Values.owner.kind }}
+    name: {{ .Values.owner.name }}
+    uid: {{ .Values.owner.uid }}
+  {{- end }}
+spec:
+  updateStrategy:
+    type: OnDelete
+  selector:
+    matchLabels:
+      app: {{ template "jindofs.name" . }}
+      role: jindofs-master
+      name: {{ template "jindofs.fullname" . }}-master
+  serviceName: "jindofs-master"
+  replicas: {{ $masterCount }}
+  template:
+    metadata:
+      annotations:
+        sidecar.istio.io/inject: "false"
+      {{- if .Values.master.annotations }}
+      {{- range $key, $val := .Values.master.annotations }}
+        {{ $key | quote }}: {{ $val | quote }}
+      {{- end }}
+      {{- end }}
+      labels:
+        name: {{ template "jindofs.fullname" . }}-master
+        app: {{ template "jindofs.name" . }}
+        chart: {{ template "jindofs.chart" . }}
+        release: {{ .Release.Name }}
+        heritage: {{ .Release.Service }}
+        role: jindofs-master
+        {{- include "library.fluid.labels" . | nindent 8 }}
+        {{- if .Values.master.labels }}
+        {{- range $key, $val := .Values.master.labels }}
+        {{ $key | quote }}: {{ $val | quote }}
+        {{- end }}
+        {{- end }}
+    spec:
+      {{- if .Values.master.imagePullSecrets }}
+      imagePullSecrets:
+{{- toYaml .Values.master.imagePullSecrets | nindent 8 }}
+      {{- else if .Values.imagePullSecrets }}
+      imagePullSecrets:
+{{- toYaml .Values.imagePullSecrets | nindent 8 }}
+      {{- end }}
+      hostNetwork: {{ .Values.useHostNetwork }}
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchExpressions:
+                - key: role
+                  operator: In
+                  values:
+                  - jindofs-master
+                - key: release
+                  operator: In
+                  values:
+                  - {{ .Release.Name  | quote }}
+              topologyKey: kubernetes.io/hostname
+      nodeSelector:
+{{- if .Values.master.nodeSelector }}
+{{ toYaml .Values.master.nodeSelector | trim | indent 8  }}
+{{- else if .Values.nodeSelector }}
+{{ toYaml .Values.nodeSelector | trim | indent 8  }}
+{{- end }}
+     {{- if .Values.master.tolerations }}
+      tolerations:
+{{ toYaml .Values.master.tolerations | indent 8 }}
+     {{- end }}
+      securityContext:
+        runAsUser: {{ .Values.user }}
+        runAsGroup: {{ .Values.group }}
+      initContainers:
+        {{ if .Values.initPortCheck.enabled -}}
+        - name: init-port-check
+          image: {{ .Values.initPortCheck.image }}:{{ .Values.initPortCheck.imageTag }}
+          imagePullPolicy: {{ .Values.initPortCheck.imagePullPolicy }}
+          securityContext:
+            privileged: true
+          command: ["/entrypoint.sh"]
+          args:
+            - "check_port"
+          env:
+            - name: PORTS_TO_CHECK
+              value: {{ .Values.initPortCheck.portsToCheck | quote }}
+      {{- end }}
+      containers:
+        - name: jindofs-master
+          image: {{ .Values.image }}:{{ .Values.imageTag }}
+          imagePullPolicy: {{ .Values.imagePullPolicy }}
+          {{- if .Values.master.resources }}
+          resources:
+            {{ toYaml .Values.master.resources | trim | nindent 12  }}
+          {{- end }}
+          command: ["/entrypoint.sh"]
+          args: ["master"]
+          env:
+          {{- if $isSingleMaster }}
+          - name: CLIENT_NAMESPACE_RPC_ADDRESS
+            value: {{ template "jindofs.fullname" . }}-master-0.{{ .Values.runtimeIdentity.namespace }}:{{ .Values.master.ports.rpc }}
+          - name: NAMESPACE_BACKEND_RAFT_HOSTNAME
+            value: {{ template "jindofs.fullname" . }}-master-0.{{ .Values.runtimeIdentity.namespace }}
+          {{- else if $isRaftHa }}
+          - name: CLIENT_NAMESPACE_RPC_ADDRESS
+            value: {{ template "jindofs.fullname" . }}-master-0.{{ .Values.runtimeIdentity.namespace }}:{{ .Values.master.ports.rpc }},{{ template "jindofs.fullname" . }}-master-1.{{ .Values.runtimeIdentity.namespace }}:{{ .Values.master.ports.rpc }},{{ template "jindofs.fullname" . }}-master-2.{{ .Values.runtimeIdentity.namespace }}:{{ .Values.master.ports.rpc }}
+          - name: NAMESPACE_BACKEND_RAFT_INITIAL_CONF
+            value: {{ template "jindofs.fullname" . }}-master-0.{{ .Values.runtimeIdentity.namespace }}:{{ .Values.master.ports.raft }}:0,{{ template "jindofs.fullname" . }}-master-1.{{ .Values.runtimeIdentity.namespace }}:{{ .Values.master.ports.raft }}:0,{{ template "jindofs.fullname" . }}-master-2.{{ .Values.runtimeIdentity.namespace }}:{{ .Values.master.ports.raft }}:0
+          - name: NAMESPACE_BACKEND_RAFT_HOSTNAME
+            value: {{ template "jindofs.fullname" . }}-master-0.{{ .Values.runtimeIdentity.namespace }},{{ template "jindofs.fullname" . }}-master-1.{{ .Values.runtimeIdentity.namespace }},{{ template "jindofs.fullname" . }}-master-2.{{ .Values.runtimeIdentity.namespace }}
+          {{- end }}
+          {{- if .Values.fuse.runAs }}
+          - name: RUN_AS_USER
+            value: {{ .Values.fuse.runAs }}
+          {{- end }}
+          {{- if .Values.master.env }}
+          {{- range $name, $val := .Values.master.env }}
+          - name: {{ $name }}
+            value: {{ $val | quote }}
+          {{- end }}
+          {{- end }}
+          {{- if .Values.master.containerCapabilities }}
+          securityContext:
+            capabilities:
+              {{ toYaml .Values.master.containerCapabilities | trim | nindent 14 }}
+          {{- end }}
+          ports:
+          - containerPort: {{ .Values.master.ports.rpc }}
+            name: rpc
+          {{- if $isRaftHa }}
+          - containerPort: {{ .Values.master.ports.raft }}
+            name: raft
+          {{- end }}
+          volumeMounts:
+            - name: bigboot-config
+              mountPath: /jindocache.cfg
+              subPath: jindocache.cfg
+            - name: bigboot-config
+              mountPath: /cacheset.xml
+              subPath: cacheset.xml
+            - name: bigboot-config
+              mountPath: /jindosdk.cfg
+              subPath: jindosdk.cfg
+          {{- range $name, $mount := .Values.mounts.master }}
+            - name: datavolume-{{ $name }}
+              mountPath: "{{ $mount.path }}"
+          {{- end }}
+          {{- if .Values.hadoopConfig }}
+          {{- if or .Values.hadoopConfig.includeCoreSite .Values.hadoopConfig.includeHdfsSite }}
+            - name: hdfs-confs
+              mountPath: /hdfs-site.xml
+              subPath: hdfs-site.xml
+          {{- end }}
+          {{- end }}
+          {{- if or .Values.secret .Values.secretProjections }}
+            {{ include "jindofs.cred.secret.volumeMounts" . | nindent 12 }}
+          {{- end }}
+          {{- if .Values.ufsVolumes }}
+          {{- range .Values.ufsVolumes }}
+            - mountPath: {{ .containerPath }}
+              name: {{ .name }}
+              readOnly: {{ .readOnly }}
+              {{- if .subPath }}
+              subPath: {{ .subPath }}
+              {{- end }}
+          {{- end }}
+          {{- end }}
+          {{- if .Values.master.volumeMounts }}
+          {{ toYaml .Values.master.volumeMounts | nindent 12 }}
+          {{- end }}
+      restartPolicy: Always
+      {{- if $notEnableDnsConfig }}
+      dnsPolicy: {{ .Values.useHostNetwork | ternary "ClusterFirstWithHostNet" "ClusterFirst" }}
+      {{- else }}
+      dnsConfig:
+        nameservers:
+        - {{ .Values.master.dnsServer }}
+        options:
+        - name: ndots
+          value: "5"
+        searches:
+        - {{ .Values.master.namespace }}.svc.cluster.local
+        - svc.cluster.local
+        - cluster.local
+        - tbsite.net
+        - aliyun.com
+      dnsPolicy: None
+      enableServiceLinks: false
+      {{- end }}
+      volumes:
+          {{- range $name, $mount := .Values.mounts.master }}
+          {{- if eq $mount.type "hostPath"}}
+        - hostPath:
+            path:  "{{ $mount.path }}"
+            type: DirectoryOrCreate
+          name: datavolume-{{ $name }}
+          {{- else if eq $mount.type "emptyDir"}}
+        - emptyDir:
+            medium: {{ eq $mount.mediumType "MEM" | ternary "Memory" "" }}
+          name: datavolume-{{ $name }}
+          {{- end }}
+          {{- end }}
+          {{- if .Values.ufsVolumes }}
+          {{- range .Values.ufsVolumes }}
+        - name: {{ .name }}
+          persistentVolumeClaim:
+            claimName: {{ .name }}
+          {{- end }}
+          {{- end }}
+        {{- if .Values.hadoopConfig }}
+        {{- if or .Values.hadoopConfig.includeCoreSite .Values.hadoopConfig.includeHdfsSite }}
+        - name: hdfs-confs
+          configMap:
+            name: {{ .Values.hadoopConfig.configMap }}
+        {{- end }}
+        {{- end }}
+        {{- if or .Values.secret .Values.secretProjections }}
+        {{ include "jindofs.cred.secret.volumes" . | nindent 8 }}
+        {{- end }}
+        {{- if .Values.master.volumes }}
+{{ toYaml .Values.master.volumes | indent 8 }}
+        {{- end }}
+        - name: bigboot-config
+          configMap:
+            name: {{ template "jindofs.fullname" . }}-config

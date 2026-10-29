@@ -1,0 +1,36 @@
+# Build the fluidapp-controller manager binary
+# golang:1.25.12-bookworm
+FROM golang:1.25.12-bookworm@sha256:a9c020ee3d1508c7be5435c262434e3d3fc1d0e76a11afeb9ddae7d60bc86aa4 as builder
+
+WORKDIR /go/src/github.com/fluid-cloudnative/fluid
+COPY hack/download-helm.sh hack/download-helm.sh
+
+ARG HELM_VERSION=v3.19.5
+RUN hack/download-helm.sh ${HELM_VERSION}
+
+COPY . .
+
+ARG FLUID_VERSION
+RUN make application-controller-build && \
+    cp bin/fluidapp-controller /go/bin/fluidapp-controller
+RUN bash hack/helm/pin_runtime_chart_version.sh "${FLUID_VERSION}"
+
+# Debug
+#RUN go install github.com/go-delve/delve/cmd/dlv@v1.8.2
+# alpine:3.23.3
+FROM alpine:3.23.3@sha256:25109184c71bdad752c8312a8623239686a9a2071e8825f20acb8f2198c3f659
+RUN apk add --update bash curl wget iproute2 libc6-compat tzdata vim &&  \
+ 	rm -rf /var/cache/apk/*
+
+ARG TARGETARCH
+ARG HELM_VERSION=v3.19.5
+COPY --from=builder /go/src/github.com/fluid-cloudnative/fluid/bin/helm/${HELM_VERSION}/helm-linux-${TARGETARCH} /usr/local/bin/ddc-helm
+RUN chmod u+x /usr/local/bin/ddc-helm
+
+COPY --from=builder /go/src/github.com/fluid-cloudnative/fluid/charts/ /charts
+
+COPY --from=builder /go/bin/fluidapp-controller /usr/local/bin/fluidapp-controller
+#COPY --from=builder /go/bin/dlv /usr/local/bin/dlv
+RUN chmod -R u+x /usr/local/bin/
+
+CMD ["fluidapp-controller", "start"]

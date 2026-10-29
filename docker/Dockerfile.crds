@@ -1,0 +1,13 @@
+# alpine:3.23.3
+FROM alpine:3.23.3@sha256:25109184c71bdad752c8312a8623239686a9a2071e8825f20acb8f2198c3f659
+
+COPY ./charts/fluid/fluid/crds /fluid/crds
+COPY ./tools/crd-upgrade/upgrade-crds.sh /fluid/upgrade-crds.sh
+
+RUN apk add --update bash curl iproute2 libc6-compat tzdata vim &&  \
+ 	rm -rf /var/cache/apk/*
+
+# need kubectl as upgrade-crds.sh uses it.
+ENV K8S_VERSION=v1.24.6
+ARG TARGETARCH
+RUN curl -o /usr/local/bin/kubectl https://storage.googleapis.com/kubernetes-release/release/${K8S_VERSION}/bin/linux/${TARGETARCH}/kubectl && chmod +x /usr/local/bin/kubectl
